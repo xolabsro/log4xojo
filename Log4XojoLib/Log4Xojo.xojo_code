@@ -1,5 +1,16 @@
 #tag Class
 Protected Class Log4Xojo
+	#tag Method, Flags = &h21
+		Private Sub ClearLogQueue()
+		  mLogQueueMutex.Enter
+		  Try
+		    mLogQueue.RemoveAll
+		  Finally
+		    mLogQueueMutex.Leave
+		  End Try
+		End Sub
+	#tag EndMethod
+
 	#tag Method, Flags = &h0
 		Sub Constructor(Name As String)
 		  If Name.Trim = "" Then
@@ -24,6 +35,8 @@ Protected Class Log4Xojo
 		  // Set up a background thread for logging only if not in DebugBuild
 		  #If Not DebugBuild Then
 		    mLogThread = New Thread
+		    mLogThread.Priority = Thread.LowestPriority
+		    mLogThread.DebugIdentifier = "Log4Xojo_" + Name
 		    AddHandler mLogThread.Run, AddressOf LogThreadHandler
 		    mRunning = True
 		    mLogThread.Start
@@ -33,26 +46,26 @@ Protected Class Log4Xojo
 
 	#tag Method, Flags = &h0
 		Sub Destructor()
-		  // // Wait for remaining messages with a timeout
-		  // Var startTime As Double = System.Microseconds
-		  // Const TimeoutMicroseconds = 5000000 // 5 seconds
-		  // 
-		  // While mLogQueue.Count > 0
-		  // mLogThread.SleepCurrent(mThreadSleepDuration)
-		  // 
-		  // // Prevent infinite wait
-		  // If System.Microseconds - startTime > TimeoutMicroseconds Then
-		  // System.DebugLog("Log4Xojo: Timeout waiting for log queue to clear")
-		  // Exit
-		  // End If
-		  // Wend
-		  // 
-		  // // Stop the thread
-		  // If mLogThread <> Nil Then
-		  // mLogThread.Stop
-		  // End If
-		  
 		  StopLogging
+		End Sub
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Sub EnqueueLogMessage(message As String)
+		  If Not mRunning Or mFileLoggingDisabled Then
+		    Return
+		  End If
+		  
+		  mLogQueueMutex.Enter
+		  Try
+		    If mLogQueue.Count >= MaxQueueSize Then
+		      mLogQueue.RemoveAt(0)
+		    End If
+		    
+		    mLogQueue.Add(message)
+		  Finally
+		    mLogQueueMutex.Leave
+		  End Try
 		End Sub
 	#tag EndMethod
 
@@ -66,26 +79,20 @@ Protected Class Log4Xojo
 	#tag Method, Flags = &h0
 		Sub Log(message As String, level As LogLevel, Optional location As String = "")
 		  #If Not DebugBuild Then
-		    // Check if the current message level is high enough to be logged
 		    If Integer(level) < Integer(mCurrentLogLevel) Then
-		      Return // Don't log messages below the current log level
+		      Return
 		    End If
 		    
-		    // Prepare the log message with timestamp and log level
 		    Var formattedMessage As String
-		    Var timestamp As String
-		    timestamp = DateTime.Now.SQLDateTime
-		    
+		    Var timestamp As String = DateTime.Now.SQLDateTime
 		    Var l As String = StringValue(level)
 		    
-		    // Construct the message with optional location
 		    If location = "" Then
 		      formattedMessage = "[" + timestamp + "] [" + l + "] " + message
 		    Else
 		      formattedMessage = "[" + timestamp + "] [" + location + "] [" + l + "] " + message
 		    End If
 		    
-		    // Existing logging logic remains the same
 		    For Each destination As LogDestination In mLogDestinations
 		      Select Case destination
 		      Case LogDestination.DebugLog
@@ -95,38 +102,17 @@ Protected Class Log4Xojo
 		        System.Log(SystemLogLevelFromLogLevel(level), formattedMessage)
 		        
 		      Case LogDestination.FileLog
-		        // Use mutex when adding to queue
-		        mLogQueueMutex.Enter
-		        Try
-		          mLogQueue.Add(formattedMessage)
-		        Finally
-		          mLogQueueMutex.Leave
-		        End Try
+		        EnqueueLogMessage(formattedMessage)
 		        
 		      Case LogDestination.All
 		        System.DebugLog(formattedMessage)
 		        System.Log(SystemLogLevelFromLogLevel(level), formattedMessage)
-		        
-		        // Use mutex when adding to queue
-		        // Optional: Prevent queue from growing too large
-		        mLogQueueMutex.Enter
-		        Try
-		          If mLogQueue.Count >= MaxQueueSize Then
-		            // Optionally: Remove oldest message to make room
-		            mLogQueue.RemoveAt(0)
-		          End If
-		          
-		          // Add new message
-		          mLogQueue.Add(formattedMessage)
-		        Finally
-		          mLogQueueMutex.Leave
-		        End Try
+		        EnqueueLogMessage(formattedMessage)
 		      End Select
 		    Next
 		  #Else
-		    // In DebugBuild, handle logging synchronously to avoid async issues
 		    If Integer(level) < Integer(mCurrentLogLevel) Then
-		      Return // Don't log messages below the current log level
+		      Return
 		    End If
 		    
 		    Var formattedMessage As String
@@ -146,11 +132,11 @@ Protected Class Log4Xojo
 		      Case LogDestination.SystemLog
 		        System.Log(SystemLogLevelFromLogLevel(level), formattedMessage)
 		      Case LogDestination.FileLog
-		        // Synchronously log to DebugLog in DebugBuild to avoid async file logging
-		        System.DebugLog(formattedMessage)
+		        WriteSingleMessageToFile(formattedMessage)
 		      Case LogDestination.All
 		        System.DebugLog(formattedMessage)
 		        System.Log(SystemLogLevelFromLogLevel(level), formattedMessage)
+		        WriteSingleMessageToFile(formattedMessage)
 		      End Select
 		    Next
 		  #EndIf
@@ -159,41 +145,115 @@ Protected Class Log4Xojo
 
 	#tag Method, Flags = &h21
 		Private Sub LogThreadHandler(sender As Thread)
-		  While mRunning Or mLogQueue.Count > 0
+		  Const RetrySleepDuration = 1000
+		  
+		  While mRunning Or (QueueCount > 0)
+		    Var messagesToLog() As String
+		    
 		    Try
-		      // Protect queue access
 		      mLogQueueMutex.Enter
-		      Var messagesToLog() As String
-		      
-		      // Retrieve multiple messages from the queue (batch processing)
-		      For i As Integer = 0 To 49 // Process up to 50 messages at a time
-		        If mLogQueue.Count > 0 Then
+		      Try
+		        For i As Integer = 0 To 49
+		          If mLogQueue.Count = 0 Then
+		            Exit
+		          End If
+		          
 		          messagesToLog.Add(mLogQueue(0))
 		          mLogQueue.RemoveAt(0)
-		        Else
-		          Exit
-		        End If
-		      Next
-		      mLogQueueMutex.Leave
+		        Next
+		      Finally
+		        mLogQueueMutex.Leave
+		      End Try
 		      
-		      // Write messages outside mutex to reduce lock time
-		      If messagesToLog.Count > 0 Then
-		        WriteToFile(messagesToLog)
-		      End If
-		      
-		      // Sleep to prevent busy waiting
 		      If messagesToLog.Count = 0 Then
-		        sender.SleepCurrent(mThreadSleepDuration)
+		        Thread.SleepCurrent(mThreadSleepDuration)
+		      Else
+		        If WriteToFile(messagesToLog) Then
+		          mConsecutiveWriteFailures = 0
+		          Thread.YieldToNext
+		        Else
+		          mConsecutiveWriteFailures = mConsecutiveWriteFailures + 1
+		          
+		          If mConsecutiveWriteFailures >= MaxWriteFailures Then
+		            mFileLoggingDisabled = True
+		            mRunning = False
+		            ClearLogQueue
+		            
+		            ReportFileLoggingDisabled(messagesToLog)
+		            Thread.YieldToNext
+		          ElseIf mRunning Then
+		            RequeueLogMessages(messagesToLog)
+		            Thread.SleepCurrent(RetrySleepDuration)
+		          Else
+		            Thread.YieldToNext
+		          End If
+		        End If
 		      End If
 		      
 		    Catch e As RuntimeException
-		      // Log any unexpected errors
 		      System.DebugLog("Log4Xojo: Logging thread error - " + e.Message)
-		      
-		      // Prevent tight error loops
-		      sender.SleepCurrent(mThreadSleepDuration)
+		      Thread.SleepCurrent(mThreadSleepDuration)
 		    End Try
 		  Wend
+		End Sub
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Function QueueCount() As Integer
+		  mLogQueueMutex.Enter
+		  Try
+		    Return mLogQueue.Count
+		  Finally
+		    mLogQueueMutex.Leave
+		  End Try
+		End Function
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Sub ReportFileLoggingDisabled(failedMessages() As String)
+		  Var message As String = "Log4Xojo: File logging disabled after " + mConsecutiveWriteFailures.ToString + " consecutive write failures."
+		  
+		  If mLogFilePath <> "" Then
+		    message = message + " Path: " + mLogFilePath
+		  End If
+		  
+		  If mLastWriteError <> "" Then
+		    message = message + " Last error: " + mLastWriteError
+		  End If
+		  
+		  If failedMessages.Count > 0 Then
+		    Var failedMessage As String = failedMessages(0)
+		    
+		    If failedMessage.Length > 1000 Then
+		      failedMessage = failedMessage.Left(1000) + "..."
+		    End If
+		    
+		    message = message + " First failed log message: " + failedMessage
+		    
+		    If failedMessages.Count > 1 Then
+		      message = message + " Failed batch size: " + failedMessages.Count.ToString
+		    End If
+		  End If
+		  
+		  System.DebugLog(message)
+		  System.Log(System.LogLevelCritical, message)
+		End Sub
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Sub RequeueLogMessages(messages() As String)
+		  mLogQueueMutex.Enter
+		  Try
+		    For Each message As String In messages
+		      If mLogQueue.Count >= MaxQueueSize Then
+		        mLogQueue.RemoveAt(0)
+		      End If
+		      
+		      mLogQueue.Add(message)
+		    Next
+		  Finally
+		    mLogQueueMutex.Leave
+		  End Try
 		End Sub
 	#tag EndMethod
 
@@ -300,24 +360,25 @@ Protected Class Log4Xojo
 
 	#tag Method, Flags = &h0
 		Sub StopLogging()
-		  // Allow the thread to continue processing the queue
-		  If mLogThread <> Nil Then
-		    Var startTime As Double = System.Microseconds
-		    Const TimeoutMicroseconds = 5000000 // 5 seconds
+		  #If Not DebugBuild Then
+		    mRunning = False
 		    
-		    While mLogQueue.Count > 0 And System.Microseconds - startTime < TimeoutMicroseconds
-		      // Sleep to allow the thread to process the queue
-		      mLogThread.SleepCurrent(mThreadSleepDuration)
-		    Wend
-		    
-		    // If the queue is still not empty, log a warning
-		    If mLogQueue.Count > 0 Then
-		      System.DebugLog("Log4Xojo: Timeout waiting for log queue to clear")
+		    If mLogThread <> Nil Then
+		      Var startTime As Double = System.Microseconds
+		      Const TimeoutMicroseconds = 5000000
+		      
+		      While QueueCount > 0 And System.Microseconds - startTime < TimeoutMicroseconds
+		        Thread.SleepCurrent(mThreadSleepDuration)
+		      Wend
+		      
+		      If QueueCount > 0 Then
+		        System.DebugLog("Log4Xojo: Timeout waiting for log queue to clear")
+		        ClearLogQueue
+		      End If
 		    End If
-		  End If
-		  
-		  // Now signal the thread to stop
-		  mRunning = False
+		  #Else
+		    mRunning = False
+		  #EndIf
 		End Sub
 	#tag EndMethod
 
@@ -360,50 +421,57 @@ Protected Class Log4Xojo
 	#tag EndMethod
 
 	#tag Method, Flags = &h21
-		Private Sub WriteToFile(messages() As String)
+		Private Sub WriteSingleMessageToFile(message As String)
+		  Var messages() As String
+		  messages.Add(message)
+		  
+		  Call WriteToFile(messages)
+		End Sub
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Function WriteToFile(messages() As String) As Boolean
 		  If mLogFilePath = "" Then
 		    mLogFilePath = SpecialFolder.Documents.Child(GenerateLogFileName()).NativePath
 		  End If
 		  
 		  Try
-		    // Create a FolderItem from the path
 		    Var logFile As New FolderItem(mLogFilePath, FolderItem.PathModes.Native)
 		    
-		    // Check and manage file size if needed
 		    If logFile.Exists And mMaxLogFileSize > 0 Then
 		      If logFile.Length >= mMaxLogFileSize Then
 		        RotateLogFile(logFile)
 		      End If
 		    End If
 		    
-		    // Open the file for appending
 		    Var out As TextOutputStream
-		    out = TextOutputStream.Open(logFile)
 		    
-		    // Write all messages
-		    For Each message As String In messages
-		      out.WriteLine(message)
-		    Next
-		    
-		    // Close the file
-		    out.Close
-		    
-		  Catch e As IOException
-		    // Add the messages back to the queue for retry
-		    mLogQueueMutex.Enter
 		    Try
+		      out = TextOutputStream.Open(logFile)
+		      
 		      For Each message As String In messages
-		        mLogQueue.Add(message)
+		        out.WriteLine(message)
 		      Next
 		    Finally
-		      mLogQueueMutex.Leave
+		      If out <> Nil Then
+		        out.Close
+		      End If
 		    End Try
 		    
+		    Return True
+		    
+		  Catch e As IOException
+		    mLastWriteError = e.Message
 		    System.DebugLog("Log4Xojo: Unable to write to log file - " + e.Message)
+		    Return False
+		    
 		  Catch e As RuntimeException
+		    mLastWriteError = e.Message
 		    System.DebugLog("Log4Xojo: Unexpected error writing log file - " + e.Message)
+		    Return False
+		    
 		  End Try
-		End Sub
+		End Function
 	#tag EndMethod
 
 
@@ -493,7 +561,19 @@ Protected Class Log4Xojo
 
 
 	#tag Property, Flags = &h21
+		Private mConsecutiveWriteFailures As Integer
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
 		Private mCurrentLogLevel As LogLevel
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mFileLoggingDisabled As Boolean
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mLastWriteError As String
 	#tag EndProperty
 
 	#tag Property, Flags = &h21
@@ -538,6 +618,9 @@ Protected Class Log4Xojo
 
 
 	#tag Constant, Name = MaxQueueSize, Type = Double, Dynamic = False, Default = \"10000", Scope = Public, Description = 4D6178696D756D206D6573736167657320696E20746865207175657565
+	#tag EndConstant
+
+	#tag Constant, Name = MaxWriteFailures, Type = Double, Dynamic = False, Default = \"5", Scope = Public
 	#tag EndConstant
 
 
