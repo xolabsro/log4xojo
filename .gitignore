@@ -6,6 +6,7 @@ Builds*
 Debug*.exe
 Debug*/Debug*.exe
 Debug*/Debug*\ Libs
+Debug*
 *.rbuistate
 *.xojo_uistate
 *.obsolete*
